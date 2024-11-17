@@ -12,7 +12,7 @@ from .layers import (
     MLPEmbedder,
     SingleStreamBlock,
     timestep_embedding,
-    ModulationOut,
+    ModulationOut
 )
 
 from einops import rearrange, repeat
@@ -32,6 +32,7 @@ class FluxParams:
     theta: int
     qkv_bias: bool
     guidance_embed: bool
+
 
 class FluxDeCLIP(nn.Module):
     """
@@ -57,7 +58,8 @@ class FluxDeCLIP(nn.Module):
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
         self.img_in = operations.Linear(self.in_channels, self.hidden_size, bias=True, dtype=dtype, device=device)
         self.txt_in = operations.Linear(params.context_in_dim, self.hidden_size, dtype=dtype, device=device)
-
+        # set as nn identity for now, will overwrite it later.
+        self.distilled_guidance_layer = nn.Identity()
         self.double_blocks = nn.ModuleList(
             [
                 DoubleStreamBlock(
@@ -215,14 +217,14 @@ class FluxDeCLIP(nn.Module):
             if ("double_block", i) in blocks_replace:
                 def block_wrap(args):
                     out = {}
-                    out["img"], out["txt"] = block(img=args["img"], txt=args["txt"], vec=args["vec"], pe=args["pe"], distill_vec=args["distill_vec"])
+                    out["img"], out["txt"] = block(img=args["img"], txt=args["txt"], pe=args["pe"], distill_vec=args["distill_vec"])
                     return out
 
-                out = blocks_replace[("double_block", i)]({"img": img, "txt": txt, "vec": None, "pe": pe, "distill_vec": double_mod}, {"original_block": block_wrap})
+                out = blocks_replace[("double_block", i)]({"img": img, "txt": txt, "pe": pe, "distill_vec": double_mod}, {"original_block": block_wrap})
                 txt = out["txt"]
                 img = out["img"]
             else:
-                img, txt = block(img=img, txt=txt, vec=None, pe=pe, distill_vec=double_mod)
+                img, txt = block(img=img, txt=txt, pe=pe, distill_vec=double_mod)
 
             if control is not None: # Controlnet
                 control_i = control.get("input")
@@ -239,10 +241,10 @@ class FluxDeCLIP(nn.Module):
 
                 def block_wrap(args):
                     out = {}
-                    out["img"] = block(args["img"], vec=args["vec"], pe=args["pe"], distill_vec=args["distill_vec"])
+                    out["img"] = block(args["img"], pe=args["pe"], distill_vec=args["distill_vec"])
                     return out
 
-                out = blocks_replace[("single_block", i)]({"img": img, "vec": None, "pe": pe, "distill_vec": single_mod}, {"original_block": block_wrap})
+                out = blocks_replace[("single_block", i)]({"img": img, "pe": pe, "distill_vec": single_mod}, {"original_block": block_wrap})
                 img = out["img"]
             else:
                 img = block(img, vec=None, pe=pe, distill_vec=single_mod)
@@ -256,7 +258,7 @@ class FluxDeCLIP(nn.Module):
 
         img = img[:, txt.shape[1] :, ...]
         final_mod = mod_vectors_dict["final_layer.adaLN_modulation.1"]
-        img = self.final_layer(img, None, distill_vec=final_mod)  # (N, T, patch_size ** 2 * out_channels)
+        img = self.final_layer(img, distill_vec=final_mod)  # (N, T, patch_size ** 2 * out_channels)
         return img
 
     def forward(self, x, timestep, context, y, guidance, control=None, transformer_options={}, **kwargs):
@@ -276,3 +278,18 @@ class FluxDeCLIP(nn.Module):
         txt_ids = torch.zeros((bs, context.shape[1], 3), device=x.device, dtype=x.dtype)
         out = self.forward_orig(img, img_ids, context, txt_ids, timestep, y, guidance, control, transformer_options)
         return rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=2, pw=2)[:,:,:h,:w]
+
+class FluxDeCLIPBaseModel(comfy.model_base.BaseModel):
+    def __init__(self, model_config, model_type=comfy.model_base.ModelType.FLUX, device=None):
+        super().__init__(model_config, model_type, device=device, unet_model=FluxDeCLIP)
+
+    def encode_adm(self, **kwargs):
+        return kwargs["pooled_output"]
+
+    def extra_conds(self, **kwargs):
+        out = super().extra_conds(**kwargs)
+        cross_attn = kwargs.get("cross_attn", None)
+        if cross_attn is not None:
+            out['c_crossattn'] = comfy.conds.CONDRegular(cross_attn)
+        out['guidance'] = comfy.conds.CONDRegular(torch.FloatTensor([kwargs.get("guidance", 3.5)]))
+        return out

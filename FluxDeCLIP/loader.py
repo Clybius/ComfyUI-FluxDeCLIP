@@ -16,7 +16,7 @@ class FluxDeCLIP(Flux):
         out = comfy.model_base.Flux(self, model_type=comfy.model_base.ModelType.FLOW, device=device)
         return out
 
-def load_FluxDeCLIP(model_path):
+def load_FluxDeCLIP(model_path, adapter_path=None):
 	state_dict = comfy.utils.load_torch_file(model_path)
 	state_dict = state_dict.get("model", state_dict)
 	parameters = comfy.utils.calculate_parameters(state_dict)
@@ -30,7 +30,8 @@ def load_FluxDeCLIP(model_path):
 		print(f"FluxDeCLIP: falling back to {manual_cast_dtype}")
 		unet_dtype = manual_cast_dtype
 
-	model_conf = FluxDeCLIP.model_config
+	model_conf = FluxDeCLIP
+	# This `model` needs to be changed to the FluxDeCLIP
 	model = comfy.model_base.Flux(
 		model_conf,
 		device=model_management.get_torch_device()
@@ -39,6 +40,9 @@ def load_FluxDeCLIP(model_path):
 	from .model import FluxDeCLIP as FluxDeCLIP_Model
 	model.diffusion_model = FluxDeCLIP_Model(**model_conf.unet_config)
 
+	if adapter_path is not None:
+		distillation_adapter = comfy.utils.load_torch_file(adapter_path, safe_load=True)
+		model.diffusion_model.distilled_guidance_layer = distillation_adapter
 	model.diffusion_model.load_state_dict(state_dict)
 	model.diffusion_model.dtype = unet_dtype
 	model.diffusion_model.eval()

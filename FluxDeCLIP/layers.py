@@ -8,6 +8,24 @@ from .math import attention, rope
 import comfy.ops
 import comfy.ldm.common_dit
 
+
+class EmbedND(nn.Module):
+    def __init__(self, dim: int, theta: int, axes_dim: list):
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+        self.axes_dim = axes_dim
+
+    def forward(self, ids: Tensor) -> Tensor:
+        n_axes = ids.shape[-1]
+        emb = torch.cat(
+            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+            dim=-3,
+        )
+
+        return emb.unsqueeze(1)
+
+
 class Approximator(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers = 4):
         super().__init__()
@@ -32,22 +50,6 @@ class Approximator(nn.Module):
         x = self.out_proj(x)
 
         return x
-
-class EmbedND(nn.Module):
-    def __init__(self, dim: int, theta: int, axes_dim: list):
-        super().__init__()
-        self.dim = dim
-        self.theta = theta
-        self.axes_dim = axes_dim
-
-    def forward(self, ids: Tensor) -> Tensor:
-        n_axes = ids.shape[-1]
-        emb = torch.cat(
-            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
-            dim=-3,
-        )
-
-        return emb.unsqueeze(1)
 
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -144,7 +146,6 @@ class DoubleStreamBlock(nn.Module):
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
         self.hidden_size = hidden_size
-        self.img_mod = Modulation(hidden_size, double=True, dtype=dtype, device=device, operations=operations)
         self.img_norm1 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias, dtype=dtype, device=device, operations=operations)
 
@@ -155,7 +156,6 @@ class DoubleStreamBlock(nn.Module):
             operations.Linear(mlp_hidden_dim, hidden_size, bias=True, dtype=dtype, device=device),
         )
 
-        self.txt_mod = Modulation(hidden_size, double=True, dtype=dtype, device=device, operations=operations)
         self.txt_norm1 = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.txt_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias, dtype=dtype, device=device, operations=operations)
 
@@ -166,14 +166,8 @@ class DoubleStreamBlock(nn.Module):
             operations.Linear(mlp_hidden_dim, hidden_size, bias=True, dtype=dtype, device=device),
         )
 
-    def forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: Tensor=None, distill_vec: Tensor=None):
-        if vec is None and distill_vec is None:
-            raise RuntimeError("vec and distill_vec are both None!")
-        if distill_vec is None:
-            img_mod1, img_mod2 = self.img_mod(vec)
-            txt_mod1, txt_mod2 = self.txt_mod(vec)
-        else:
-            (img_mod1, img_mod2), (txt_mod1, txt_mod2) = distill_vec
+    def forward(self, img: Tensor, txt: Tensor, pe: Tensor, distill_vec: Tensor=None):
+        (img_mod1, img_mod2), (txt_mod1, txt_mod2) = distill_vec
 
         # prepare image for attention
         img_modulated = self.img_norm1(img)
@@ -244,15 +238,9 @@ class SingleStreamBlock(nn.Module):
         self.pre_norm = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
 
         self.mlp_act = nn.GELU(approximate="tanh")
-        self.modulation = Modulation(hidden_size, double=False, dtype=dtype, device=device, operations=operations)
 
-    def forward(self, x: Tensor, pe: Tensor, vec: Tensor=None, distill_vec: Tensor=None) -> Tensor:
-        if vec is None and distill_vec is None:
-            raise RuntimeError("vec and distill_vec are both None!")
-        if distill_vec is None:
-            mod, _ = self.modulation(vec)
-        else:
-            mod = distill_vec
+    def forward(self, x: Tensor, pe: Tensor, distill_vec: Tensor=None) -> Tensor:
+        mod = distill_vec
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
@@ -274,17 +262,11 @@ class LastLayer(nn.Module):
         super().__init__()
         self.norm_final = operations.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
         self.linear = operations.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True, dtype=dtype, device=device)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), operations.Linear(hidden_size, 2 * hidden_size, bias=True, dtype=dtype, device=device))
 
-    def forward(self, x: Tensor, vec: Tensor=None, distill_vec: Tensor=None) -> Tensor:
-        if vec is None and distill_vec is None:
-            raise RuntimeError("vec and distill_vec are both None!")
-        if distill_vec is None:
-            shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
-        else:
-            shift, scale = distill_vec
-            shift = shift.squeeze(1)
-            scale = scale.squeeze(1)
+    def forward(self, x: Tensor, distill_vec: Tensor=None) -> Tensor:
+        shift, scale = distill_vec
+        shift = shift.squeeze(1)
+        scale = scale.squeeze(1)
         x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
         x = self.linear(x)
         return x
